@@ -23,6 +23,7 @@ import org.apache.flink.connector.file.table.FileSystemTableFactory;
 import org.apache.flink.formats.testcsv.TestCsvFormatFactory;
 import org.apache.flink.table.api.DataTypes;
 import org.apache.flink.table.api.Schema;
+import org.apache.flink.table.api.config.TableConfigOptions;
 import org.apache.flink.table.api.config.TableConfigOptions.CatalogPlanCompilation;
 import org.apache.flink.table.api.config.TableConfigOptions.CatalogPlanRestore;
 import org.apache.flink.table.catalog.CatalogManager;
@@ -36,6 +37,7 @@ import org.apache.flink.table.factories.FactoryUtil;
 import org.apache.flink.table.factories.TestDynamicTableFactory;
 import org.apache.flink.table.factories.TestFormatFactory;
 import org.apache.flink.table.planner.calcite.FlinkTypeFactory;
+import org.apache.flink.table.planner.calcite.FlinkTypeSystem;
 import org.apache.flink.table.planner.factories.TestValuesTableFactory;
 import org.apache.flink.table.planner.plan.abilities.source.FilterPushDownSpec;
 import org.apache.flink.table.planner.plan.abilities.source.LimitPushDownSpec;
@@ -52,6 +54,8 @@ import org.apache.flink.table.types.logical.LogicalType;
 import org.apache.flink.table.types.logical.RowType;
 import org.apache.flink.table.types.logical.TimestampKind;
 import org.apache.flink.table.types.logical.TimestampType;
+import org.apache.flink.table.watermark.WatermarkEmitStrategy;
+import org.apache.flink.table.watermark.WatermarkParams;
 
 import org.apache.calcite.avatica.util.TimeUnit;
 import org.apache.calcite.rex.RexBuilder;
@@ -66,14 +70,13 @@ import org.junit.jupiter.params.provider.MethodSource;
 
 import java.io.IOException;
 import java.math.BigDecimal;
+import java.time.Duration;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.stream.Stream;
 
-import static org.apache.flink.table.api.EnvironmentSettings.DEFAULT_BUILTIN_CATALOG;
-import static org.apache.flink.table.api.EnvironmentSettings.DEFAULT_BUILTIN_DATABASE;
 import static org.apache.flink.table.api.config.TableConfigOptions.PLAN_COMPILE_CATALOG_OBJECTS;
 import static org.apache.flink.table.api.config.TableConfigOptions.PLAN_RESTORE_CATALOG_OBJECTS;
 import static org.apache.flink.table.factories.FactoryUtil.CONNECTOR;
@@ -114,8 +117,8 @@ public class DynamicTableSourceSpecSerdeTest {
                 new DynamicTableSourceSpec(
                         ContextResolvedTable.temporary(
                                 ObjectIdentifier.of(
-                                        DEFAULT_BUILTIN_CATALOG,
-                                        DEFAULT_BUILTIN_DATABASE,
+                                        TableConfigOptions.TABLE_CATALOG_NAME.defaultValue(),
+                                        TableConfigOptions.TABLE_DATABASE_NAME.defaultValue(),
                                         "MyTable"),
                                 new ResolvedCatalogTable(catalogTable1, resolvedSchema1)),
                         null);
@@ -148,14 +151,16 @@ public class DynamicTableSourceSpecSerdeTest {
                         Collections.emptyList(),
                         options2);
 
-        FlinkTypeFactory factory = FlinkTypeFactory.INSTANCE();
+        FlinkTypeFactory factory =
+                new FlinkTypeFactory(
+                        Thread.currentThread().getContextClassLoader(), FlinkTypeSystem.INSTANCE);
         RexBuilder rexBuilder = new RexBuilder(factory);
         DynamicTableSourceSpec spec2 =
                 new DynamicTableSourceSpec(
                         ContextResolvedTable.temporary(
                                 ObjectIdentifier.of(
-                                        DEFAULT_BUILTIN_CATALOG,
-                                        DEFAULT_BUILTIN_DATABASE,
+                                        TableConfigOptions.TABLE_CATALOG_NAME.defaultValue(),
+                                        TableConfigOptions.TABLE_DATABASE_NAME.defaultValue(),
                                         "MyTable"),
                                 new ResolvedCatalogTable(catalogTable2, resolvedSchema2)),
                         Arrays.asList(
@@ -210,8 +215,14 @@ public class DynamicTableSourceSpecSerdeTest {
                                                 new BigIntType(),
                                                 new IntType(),
                                                 new IntType(),
-                                                new TimestampType(
-                                                        false, TimestampKind.ROWTIME, 3))),
+                                                new TimestampType(false, TimestampKind.ROWTIME, 3)),
+                                        WatermarkParams.builder()
+                                                .emitStrategy(WatermarkEmitStrategy.ON_PERIODIC)
+                                                .alignGroupName("align-group-1")
+                                                .alignMaxDrift(Duration.ofMinutes(1))
+                                                .alignUpdateInterval(Duration.ofSeconds(1))
+                                                .sourceIdleTimeout(60000)
+                                                .build()),
                                 new SourceWatermarkSpec(
                                         true,
                                         RowType.of(
@@ -266,7 +277,10 @@ public class DynamicTableSourceSpecSerdeTest {
         assertThat(actual.getContextResolvedTable()).isEqualTo(spec.getContextResolvedTable());
         assertThat(actual.getSourceAbilities()).isEqualTo(spec.getSourceAbilities());
 
-        assertThat(actual.getScanTableSource(plannerMocks.getPlannerContext().getFlinkContext()))
+        assertThat(
+                        actual.getScanTableSource(
+                                plannerMocks.getPlannerContext().getFlinkContext(),
+                                serdeCtx.getTypeFactory()))
                 .isNotNull();
     }
 
@@ -274,7 +288,10 @@ public class DynamicTableSourceSpecSerdeTest {
     void testDynamicTableSourceSpecSerdeWithEnrichmentOptions() throws Exception {
         // Test model
         ObjectIdentifier identifier =
-                ObjectIdentifier.of(DEFAULT_BUILTIN_CATALOG, DEFAULT_BUILTIN_DATABASE, "my_table");
+                ObjectIdentifier.of(
+                        TableConfigOptions.TABLE_CATALOG_NAME.defaultValue(),
+                        TableConfigOptions.TABLE_DATABASE_NAME.defaultValue(),
+                        "my_table");
 
         String formatPrefix = FactoryUtil.getFormatPrefix(FORMAT, TestFormatFactory.IDENTIFIER);
 
@@ -328,7 +345,8 @@ public class DynamicTableSourceSpecSerdeTest {
         TestDynamicTableFactory.DynamicTableSourceMock dynamicTableSource =
                 (TestDynamicTableFactory.DynamicTableSourceMock)
                         actual.getScanTableSource(
-                                plannerMocks.getPlannerContext().getFlinkContext());
+                                plannerMocks.getPlannerContext().getFlinkContext(),
+                                serdeCtx.getTypeFactory());
 
         assertThat(dynamicTableSource.password).isEqualTo("xyz");
         assertThat(

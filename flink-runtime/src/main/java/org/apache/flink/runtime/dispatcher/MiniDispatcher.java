@@ -18,24 +18,23 @@
 
 package org.apache.flink.runtime.dispatcher;
 
+import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.api.common.JobID;
 import org.apache.flink.api.common.JobStatus;
-import org.apache.flink.api.common.time.Time;
 import org.apache.flink.runtime.clusterframework.ApplicationStatus;
+import org.apache.flink.runtime.dispatcher.cleanup.ResourceCleanerFactory;
 import org.apache.flink.runtime.entrypoint.ClusterEntrypoint;
 import org.apache.flink.runtime.entrypoint.JobClusterEntrypoint;
-import org.apache.flink.runtime.executiongraph.ArchivedExecutionGraph;
-import org.apache.flink.runtime.jobgraph.JobGraph;
 import org.apache.flink.runtime.jobmaster.JobResult;
 import org.apache.flink.runtime.messages.Acknowledge;
 import org.apache.flink.runtime.rpc.RpcService;
-import org.apache.flink.runtime.scheduler.ExecutionGraphInfo;
+import org.apache.flink.streaming.api.graph.ExecutionPlan;
 import org.apache.flink.util.CollectionUtil;
 import org.apache.flink.util.FlinkException;
 
 import javax.annotation.Nullable;
 
-import java.util.Objects;
+import java.time.Duration;
 import java.util.concurrent.CompletableFuture;
 
 import static org.apache.flink.util.Preconditions.checkNotNull;
@@ -44,7 +43,7 @@ import static org.apache.flink.util.Preconditions.checkNotNull;
  * Mini Dispatcher which is instantiated as the dispatcher component by the {@link
  * JobClusterEntrypoint}.
  *
- * <p>The mini dispatcher is initialized with a single {@link JobGraph} which it runs.
+ * <p>The mini dispatcher is initialized with a single {@link ExecutionPlan} which it runs.
  *
  * <p>Depending on the {@link ClusterEntrypoint.ExecutionMode}, the mini dispatcher will directly
  * terminate after job completion if its execution mode is {@link
@@ -59,7 +58,7 @@ public class MiniDispatcher extends Dispatcher {
             RpcService rpcService,
             DispatcherId fencingToken,
             DispatcherServices dispatcherServices,
-            @Nullable JobGraph jobGraph,
+            @Nullable ExecutionPlan executionPlan,
             @Nullable JobResult recoveredDirtyJob,
             DispatcherBootstrapFactory dispatcherBootstrapFactory,
             JobClusterEntrypoint.ExecutionMode executionMode)
@@ -67,7 +66,7 @@ public class MiniDispatcher extends Dispatcher {
         super(
                 rpcService,
                 fencingToken,
-                CollectionUtil.ofNullable(jobGraph),
+                CollectionUtil.ofNullable(executionPlan),
                 CollectionUtil.ofNullable(recoveredDirtyJob),
                 dispatcherBootstrapFactory,
                 dispatcherServices);
@@ -75,10 +74,35 @@ public class MiniDispatcher extends Dispatcher {
         this.executionMode = checkNotNull(executionMode);
     }
 
+    @VisibleForTesting
+    public MiniDispatcher(
+            RpcService rpcService,
+            DispatcherId fencingToken,
+            DispatcherServices dispatcherServices,
+            @Nullable ExecutionPlan executionPlan,
+            @Nullable JobResult recoveredDirtyJob,
+            DispatcherBootstrapFactory dispatcherBootstrapFactory,
+            JobManagerRunnerRegistry jobManagerRunnerRegistry,
+            ResourceCleanerFactory resourceCleanerFactory,
+            JobClusterEntrypoint.ExecutionMode executionMode)
+            throws Exception {
+        super(
+                rpcService,
+                fencingToken,
+                CollectionUtil.ofNullable(executionPlan),
+                CollectionUtil.ofNullable(recoveredDirtyJob),
+                dispatcherBootstrapFactory,
+                dispatcherServices,
+                jobManagerRunnerRegistry,
+                resourceCleanerFactory);
+
+        this.executionMode = checkNotNull(executionMode);
+    }
+
     @Override
-    public CompletableFuture<Acknowledge> submitJob(JobGraph jobGraph, Time timeout) {
+    public CompletableFuture<Acknowledge> submitJob(ExecutionPlan executionPlan, Duration timeout) {
         final CompletableFuture<Acknowledge> acknowledgeCompletableFuture =
-                super.submitJob(jobGraph, timeout);
+                super.submitJob(executionPlan, timeout);
 
         acknowledgeCompletableFuture.whenComplete(
                 (Acknowledge ignored, Throwable throwable) -> {
@@ -86,7 +110,7 @@ public class MiniDispatcher extends Dispatcher {
                         onFatalError(
                                 new FlinkException(
                                         "Failed to submit job "
-                                                + jobGraph.getJobID()
+                                                + executionPlan.getJobID()
                                                 + " in job mode.",
                                         throwable));
                     }
@@ -96,7 +120,7 @@ public class MiniDispatcher extends Dispatcher {
     }
 
     @Override
-    public CompletableFuture<JobResult> requestJobResult(JobID jobId, Time timeout) {
+    public CompletableFuture<JobResult> requestJobResult(JobID jobId, Duration timeout) {
         final CompletableFuture<JobResult> jobResultFuture = super.requestJobResult(jobId, timeout);
 
         if (executionMode == ClusterEntrypoint.ExecutionMode.NORMAL) {
@@ -123,32 +147,24 @@ public class MiniDispatcher extends Dispatcher {
     }
 
     @Override
-    public CompletableFuture<Acknowledge> cancelJob(JobID jobId, Time timeout) {
+    public CompletableFuture<Acknowledge> cancelJob(JobID jobId, Duration timeout) {
         jobCancelled = true;
         return super.cancelJob(jobId, timeout);
     }
 
     @Override
-    protected CleanupJobState jobReachedTerminalState(ExecutionGraphInfo executionGraphInfo) {
-        final ArchivedExecutionGraph archivedExecutionGraph =
-                executionGraphInfo.getArchivedExecutionGraph();
-        final CleanupJobState cleanupHAState = super.jobReachedTerminalState(executionGraphInfo);
+    protected void runPostJobGloballyTerminated(JobID jobId, JobStatus jobStatus) {
+        super.runPostJobGloballyTerminated(jobId, jobStatus);
 
-        JobStatus jobStatus =
-                Objects.requireNonNull(
-                        archivedExecutionGraph.getState(), "JobStatus should not be null here.");
-        if (jobStatus.isGloballyTerminalState()
-                && (jobCancelled || executionMode == ClusterEntrypoint.ExecutionMode.DETACHED)) {
-            // shut down if job is cancelled or we don't have to wait for the execution result
-            // retrieval
+        if (jobCancelled || executionMode == ClusterEntrypoint.ExecutionMode.DETACHED) {
+            // shut down if job is cancelled or we don't have to wait for the execution
+            // result retrieval
             log.info(
-                    "Shutting down cluster with state {}, jobCancelled: {}, executionMode: {}",
+                    "Shutting down cluster after job with state {}, jobCancelled: {}, executionMode: {}",
                     jobStatus,
                     jobCancelled,
                     executionMode);
             shutDownFuture.complete(ApplicationStatus.fromJobStatus(jobStatus));
         }
-
-        return cleanupHAState;
     }
 }
